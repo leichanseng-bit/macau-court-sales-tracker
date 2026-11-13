@@ -1231,6 +1231,10 @@ def export_to_excel_and_csv(db: CourtSaleDatabase, excel_path: str = "macau_cour
             ),
             db.conn,
         )
+        df_industrial = pd.read_sql_query(
+            base_focus_sql.format(where_clause="p.is_active = 1 AND p.target_category = '工業'"),
+            db.conn,
+        )
 
         # 5：跨期重拍與價差監察專頁
         df_repeated = pd.read_sql_query(
@@ -1323,6 +1327,7 @@ def export_to_excel_and_csv(db: CourtSaleDatabase, excel_path: str = "macau_cour
             df_parking,
             df_commercial,
             df_movable,
+            df_industrial,
             df_repeated,
             df_weekly_auction,
             df_cycle_stats,
@@ -1336,6 +1341,7 @@ def export_to_excel_and_csv(db: CourtSaleDatabase, excel_path: str = "macau_cour
             df_parking.to_excel(writer, sheet_name="停車位重點追蹤", index=False)
             df_commercial.to_excel(writer, sheet_name="商業／寫字樓重點追蹤", index=False)
             df_movable.to_excel(writer, sheet_name="動產重點追蹤", index=False)
+            df_industrial.to_excel(writer, sheet_name="工業重點追蹤", index=False)
             df_repeated.to_excel(writer, sheet_name="跨期重拍與價差監察", index=False)
             df_weekly_auction.to_excel(writer, sheet_name="每週開標數量統計", index=False)
             df_cycle_stats.to_excel(writer, sheet_name="每週追蹤周期紀錄", index=False)
@@ -1624,7 +1630,7 @@ def export_html_dashboard(
 
     <!-- 第一區：KPI 重點指標卡片 (點擊可快速切換分類) -->
     <section aria-label="關鍵統計指標">
-      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3.5">
+      <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">
         <button type="button" data-tab-target="ALL" class="kpi-card group text-left bg-white p-4 rounded-xl border border-slate-200 shadow-sm hover:border-blue-500 transition">
           <div class="flex items-center justify-between text-xs font-medium text-slate-500">
             <span>全部變賣標的</span>
@@ -1668,6 +1674,15 @@ def export_html_dashboard(
           </div>
           <div id="kpiMovable" class="mt-1.5 text-2xl font-bold text-purple-700">0</div>
           <div class="mt-0.5 text-xs text-slate-500">車輛及保管箱飾品</div>
+        </button>
+
+        <button type="button" data-tab-target="INDUSTRIAL_EQUITY" class="kpi-card group text-left bg-white p-4 rounded-xl border border-slate-200 shadow-sm hover:border-slate-500 transition">
+          <div class="flex items-center justify-between text-xs font-medium text-slate-700">
+            <span>工業及公司股權</span>
+            <span class="text-base">🏭</span>
+          </div>
+          <div id="kpiIndustrialEquity" class="mt-1.5 text-2xl font-bold text-slate-700">0</div>
+          <div id="kpiIndustrialEquitySub" class="mt-0.5 text-xs text-slate-500">工業・股權及其他</div>
         </button>
 
         <button type="button" data-tab-target="REPEATED" class="kpi-card group text-left bg-amber-50/70 p-4 rounded-xl border border-amber-300 shadow-sm hover:border-rose-500 transition">
@@ -1751,6 +1766,12 @@ def export_html_dashboard(
           </button>
           <button type="button" data-tab="MOVABLE" class="tab-btn px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-200 transition">
             📦 動產重點追蹤 (<span id="tabCountMov">0</span>)
+          </button>
+          <button type="button" data-tab="INDUSTRIAL" class="tab-btn px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-200 transition">
+            🏭 工業重點追蹤 (<span id="tabCountInd">0</span>)
+          </button>
+          <button type="button" data-tab="INDUSTRIAL_EQUITY" class="tab-btn px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-200 transition">
+            💼 工業及公司股權／其他 (<span id="tabCountIndEq">0</span>)
           </button>
           <button type="button" data-tab="REPEATED" class="tab-btn px-3 py-1.5 rounded-lg text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 transition">
             🔄 跨期重拍與價差監察 (<span id="tabCountRep">0</span>)
@@ -1885,6 +1906,8 @@ def export_html_dashboard(
       const parkProps = activeProps.filter(p => p.is_parking === 1);
       const commProps = activeProps.filter(p => p.target_category === '商業/寫字樓');
       const movProps = activeProps.filter(p => p.asset_kind === '動產' || (p.target_category && p.target_category.startsWith('動產')));
+      const indProps = activeProps.filter(p => p.target_category === '工業');
+      const indEqProps = activeProps.filter(p => p.is_residential !== 1 && p.is_parking !== 1 && p.target_category !== '商業/寫字樓' && !(p.asset_kind === '動產' || (p.target_category && p.target_category.startsWith('動產'))));
       const repProps = allProps.filter(p => (p.prior_appearances_count || 0) > 0);
 
       const avgRes = resProps.length ? resProps.reduce((s, x) => s + (x.base_price_mop || 0), 0) / resProps.length : 0;
@@ -1900,6 +1923,8 @@ def export_html_dashboard(
       document.getElementById('kpiCommercial').textContent = commProps.length + ' 項';
       document.getElementById('kpiCommercialAvg').textContent = `均價 MOP ${{(avgComm / 10000).toFixed(1)}} 萬`;
       document.getElementById('kpiMovable').textContent = movProps.length + ' 項';
+      document.getElementById('kpiIndustrialEquity').textContent = indEqProps.length + ' 項';
+      document.getElementById('kpiIndustrialEquitySub').textContent = `工業 ${{indProps.length}} 項・股權及其他 ${{indEqProps.length - indProps.length}} 項`;
       document.getElementById('kpiRepeated').textContent = repProps.length + ' 項';
       document.getElementById('kpiPriceChangedSub').textContent = `已過開標期歸檔: ${{archivedProps.length}} 項`;
 
@@ -1908,6 +1933,8 @@ def export_html_dashboard(
       document.getElementById('tabCountPark').textContent = parkProps.length;
       document.getElementById('tabCountComm').textContent = commProps.length;
       document.getElementById('tabCountMov').textContent = movProps.length;
+      document.getElementById('tabCountInd').textContent = indProps.length;
+      document.getElementById('tabCountIndEq').textContent = indEqProps.length;
       document.getElementById('tabCountRep').textContent = repProps.length;
       document.getElementById('tabCountArc').textContent = archivedProps.length;
 
@@ -2048,6 +2075,8 @@ def export_html_dashboard(
           if (state.activeTab === 'PARKING' && p.is_parking !== 1) return false;
           if (state.activeTab === 'COMMERCIAL' && p.target_category !== '商業/寫字樓') return false;
           if (state.activeTab === 'MOVABLE' && !(p.asset_kind === '動產' || (p.target_category && p.target_category.startsWith('動產')))) return false;
+          if (state.activeTab === 'INDUSTRIAL' && p.target_category !== '工業') return false;
+          if (state.activeTab === 'INDUSTRIAL_EQUITY' && (p.is_residential === 1 || p.is_parking === 1 || p.target_category === '商業/寫字樓' || p.asset_kind === '動產' || (p.target_category && p.target_category.startsWith('動產')))) return false;
         }}
 
         if (state.selectedWeek !== 'ALL') {{
