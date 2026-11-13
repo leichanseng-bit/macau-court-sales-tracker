@@ -636,25 +636,54 @@ class CourtSaleDatabase:
                     ),
                 )
 
-        # 將所有「開標日 < today_str」或「不在本週期網站列表 (last_seen_cycle != cycle_id)」的舊紀錄統一歸檔為已過開標期
-        cursor.execute(
-            """
-            UPDATE cases
-            SET is_active = 0,
-                lifecycle_status = '⚪ 已過開標期(歷史歸檔)'
-            WHERE auction_date < ? OR last_seen_cycle != ?
-            """,
-            (today_str, cycle_id),
-        )
-        cursor.execute(
-            """
-            UPDATE properties
-            SET is_active = 0,
-                lifecycle_status = '⚪ 已過開標期(歷史歸檔)'
-            WHERE auction_date < ? OR last_seen_cycle != ?
-            """,
-            (today_str, cycle_id),
-        )
+        # 清理因舊版 prop_uid 格式不同而殘留的同案號同開標日重複列 (只保留本次最新寫入的 seen_prop_uids / seen_case_uids)
+        if seen_prop_uids:
+            placeholders_p = ",".join("?" for _ in seen_prop_uids)
+            cursor.execute(
+                f"""
+                DELETE FROM properties
+                WHERE prop_uid NOT IN ({placeholders_p})
+                  AND (
+                      auction_date >= ?
+                      OR EXISTS (
+                          SELECT 1 FROM properties p2
+                          WHERE p2.prop_uid IN ({placeholders_p})
+                            AND p2.case_no = properties.case_no
+                            AND p2.auction_date = properties.auction_date
+                            AND p2.item_index = properties.item_index
+                      )
+                  )
+                """,
+                (*seen_prop_uids, today_str, *seen_prop_uids),
+            )
+            cursor.execute(
+                f"""
+                UPDATE properties
+                SET is_active = 0,
+                    lifecycle_status = '⚪ 已過開標期(歷史歸檔)'
+                WHERE auction_date < ? OR prop_uid NOT IN ({placeholders_p})
+                """,
+                (today_str, *seen_prop_uids),
+            )
+        if seen_case_uids:
+            placeholders_c = ",".join("?" for _ in seen_case_uids)
+            cursor.execute(
+                f"""
+                DELETE FROM cases
+                WHERE case_uid NOT IN ({placeholders_c})
+                  AND auction_date >= ?
+                """,
+                (*seen_case_uids, today_str),
+            )
+            cursor.execute(
+                f"""
+                UPDATE cases
+                SET is_active = 0,
+                    lifecycle_status = '⚪ 已過開標期(歷史歸檔)'
+                WHERE auction_date < ? OR case_uid NOT IN ({placeholders_c})
+                """,
+                (today_str, *seen_case_uids),
+            )
 
         # 統計當前「🟢 待開標(在列)」與「⚪ 已過開標期(歷史歸檔)」數量
         cursor.execute("SELECT COUNT(*) AS cnt FROM cases WHERE is_active = 1")
@@ -862,11 +891,9 @@ def parse_property_block(lines: List[str], item_index: int, case_uid: str, case_
         item_index=item_index,
     )
 
-    prop_key = f"{case_uid}#item{item_index}_{prop_name}_{registry_id}"
-    prop_uid = hashlib.sha1(prop_key.encode("utf-8")).hexdigest()[:16]
-
+    norm_cno = re.sub(r"\s+", "", (case_no or "")).upper()
     return {
-        "prop_uid": f"{case_no}_{auction_date}_P{item_index}_{prop_uid[:6]}",
+        "prop_uid": f"{norm_cno}_{auction_date}_P{item_index}",
         "canonical_asset_id": canonical_asset_id,
         "item_index": item_index,
         "asset_kind": asset_kind or "未標明",
