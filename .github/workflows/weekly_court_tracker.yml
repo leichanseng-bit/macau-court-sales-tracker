@@ -1,0 +1,53 @@
+name: Weekly Macau Court Judicial Sale Tracker
+
+on:
+  schedule:
+    - cron: '0 1 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  track-and-update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. 檢出專案原始碼與現有 SQLite 資料庫 (Checkout Repository)
+        uses: actions/checkout@v4
+
+      - name: 2. 設定 Python 3.11 執行環境 (Set up Python)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 3. 安裝必要 Python 套件 (Install Dependencies)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 4. 執行澳門法院司法變賣爬蟲與跨期比對 (Run Tracker & Generate Reports)
+        env:
+          TZ: Asia/Macau
+        run: |
+          python macau_court_tracker.py \
+            --db macau_court_sales.db \
+            --excel macau_court_sales_report.xlsx \
+            --archive-dir weekly_reports \
+            --dashboard index.html
+          cp index.html macau_court_dashboard.html
+
+      - name: 5. 自動將更新後的資料庫、最新總表、每週獨立 Excel 與 HTML 儀表板提交回 GitHub
+        env:
+          TZ: Asia/Macau
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add macau_court_sales.db macau_court_sales_report.xlsx weekly_reports/ macau_court_dashboard.html index.html
+          if git diff --staged --quiet; then
+            echo "本週資料無變動，無需提交。"
+          else
+            git commit -m "chore(data): 每週自動更新澳門法院司法變賣資料庫、最新總表與每週歸檔報表 ($(date +'%Y-%m-%d'))"
+            git push
+          fi
