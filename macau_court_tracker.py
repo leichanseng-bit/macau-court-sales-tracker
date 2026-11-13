@@ -76,8 +76,11 @@ def build_canonical_asset_id(
         raw_key = f"REG:{norm_reg}|NAME:{norm_name}|ITEM:{item_index}"
     elif norm_case and (norm_name or norm_addr):
         raw_key = f"CASE:{norm_case}|TAX:{norm_tax}|NAME:{norm_name}|ADDR:{norm_addr}|ITEM:{item_index}"
+    elif norm_case or norm_name or norm_addr:
+        raw_key = f"CASE:{norm_case}|ITEM:{item_index}|NAME:{norm_name}|ADDR:{norm_addr}"
     else:
-        raw_key = f"CASE:{norm_case}|ITEM:{item_index}|ADDR:{norm_addr}"
+        import uuid
+        raw_key = f"UNPARSED:{uuid.uuid4().hex}"
 
     digest = hashlib.sha1(raw_key.encode("utf-8")).hexdigest()[:14]
     return f"ASSET_{digest}"
@@ -410,6 +413,11 @@ class CourtSaleDatabase:
         cases = parsed_data.get("cases", [])
 
         cursor = self.conn.cursor()
+
+        # 自動清理過去因網頁標籤換行解析異常所產生的空白案號紀錄 (確保資料庫潔淨)
+        cursor.execute("DELETE FROM property_appearances WHERE case_no IS NULL OR TRIM(case_no) = ''")
+        cursor.execute("DELETE FROM properties WHERE case_no IS NULL OR TRIM(case_no) = ''")
+        cursor.execute("DELETE FROM cases WHERE case_no IS NULL OR TRIM(case_no) = ''")
 
         # 先將所有不在本次網站列表、或開標日期已早於基準日 (today_str) 的舊案件與財產標記為歷史歸檔
         seen_case_uids = []
@@ -878,8 +886,47 @@ def parse_property_block(lines: List[str], item_index: int, case_uid: str, case_
 
 
 def parse_court_sell_text(raw_text: str) -> Dict:
-    lines = [line.strip() for line in raw_text.splitlines()]
-    lines = [line for line in lines if line]
+    raw_lines = [line.strip() for line in raw_text.splitlines()]
+    raw_lines = [line for line in raw_lines if line]
+
+    # 預處理：若 HTML 標籤導致「欄位名稱：」或「欄位名稱-」單獨成行、數值在下一行，自動合併為同一行
+    standalone_colon_keys = {
+        "類別：", "類別:", "編號：", "編號:", "法庭：", "法庭:",
+        "請求執行人：", "請求執行人:", "要求清償債權人：", "要求清償債權人:",
+        "債權人：", "債權人:", "申請人：", "申請人:", "原告：", "原告:",
+        "聲請人：", "聲請人:", "被執行人：", "被執行人:", "被申請人：", "被申請人:",
+        "被告：", "被告:", "被聲請人：", "被聲請人:", "利害關係人：", "利害關係人:",
+        "參與人：", "參與人:", "聲明異議人：", "聲明異議人:",
+        "方式：", "方式:", "截標時間：", "截標時間:", "變賣時間：", "變賣時間:",
+        "變賣地點：", "變賣地點:", "受寄人：", "受寄人:", "聯絡資料：", "聯絡資料:",
+    }
+    standalone_dash_keys = {
+        "描述", "名稱", "座落地點", "用途", "財政局編號", "登記局編號", "分層所有權登錄編號", "變賣底價"
+    }
+    lines = []
+    idx_r = 0
+    while idx_r < len(raw_lines):
+        cur = raw_lines[idx_r]
+        if cur in standalone_colon_keys and idx_r + 1 < len(raw_lines):
+            nxt = raw_lines[idx_r + 1]
+            if nxt not in ("案件資料", "變賣資料", "變賣財產") and not re.match(r"^\d{4}-\d{2}-\d{2}$", nxt):
+                lines.append(f"{cur} {nxt}")
+                idx_r += 2
+                continue
+        if re.match(r"^(描述|名稱|座落地點|用途|財政局編號|登記局編號|分層所有權登錄編號|變賣底價)\s*[-:：]?$", cur) and idx_r + 1 < len(raw_lines):
+            nxt = raw_lines[idx_r + 1]
+            if nxt in ("-", "：", ":") and idx_r + 2 < len(raw_lines):
+                key_clean = re.sub(r"[-:：\s]+$", "", cur)
+                lines.append(f"{key_clean}- {raw_lines[idx_r + 2]}")
+                idx_r += 3
+                continue
+            elif not re.match(r"^(描述|名稱|座落地點|用途|財政局編號|登記局編號|分層所有權登錄編號|變賣底價|受寄人|聯絡資料|備註|第\s*\d+\s*項|不動產|動產|權利)", nxt):
+                key_clean = re.sub(r"[-:：\s]+$", "", cur)
+                lines.append(f"{key_clean}- {nxt}")
+                idx_r += 2
+                continue
+        lines.append(cur)
+        idx_r += 1
 
     last_updated = ""
     for line in lines:
@@ -1043,6 +1090,17 @@ def fetch_court_sell_page(url: str = TARGET_URL, timeout: int = 30) -> str:
     resp.encoding = "utf-8"
 
     soup = BeautifulSoup(resp.text, "html.parser")
+    # 將 <br> 轉為換行，並確保行內標籤 (span/strong/b/a/label) 不會被拆成多行
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+    for inline_tag in soup.find_all(["span", "strong", "b", "i", "em", "a", "label", "font"]):
+        inline_tag.unwrap()
+    # 若表格儲存格 <td> 或 <th> 內為「欄位名：」與「數值」，將同一列 <tr> 合併成單行方便解析
+    for tr in soup.find_all("tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+        cells = [c for c in cells if c]
+        if len(cells) >= 2 and (cells[0].endswith("：") or cells[0].endswith(":") or cells[0].endswith("-")):
+            tr.replace_with(soup.new_string("\n" + " ".join(cells) + "\n"))
     return soup.get_text("\n")
 
 
