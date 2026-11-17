@@ -233,6 +233,23 @@ class CourtSaleDatabase:
             """
         )
 
+        # 3.5. 各追蹤週期快照明細表 (支援儀表板隨時切換回看任意歷史星期的完整狀態)
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cycle_properties_snapshot (
+                cycle_id TEXT NOT NULL,
+                prop_uid TEXT NOT NULL,
+                is_active_at_cycle INTEGER DEFAULT 1,
+                base_price_mop REAL,
+                prior_appearances_count INTEGER DEFAULT 0,
+                price_diff_mop REAL,
+                price_diff_pct REAL,
+                repeat_status_flag TEXT,
+                PRIMARY KEY (cycle_id, prop_uid)
+            )
+            """
+        )
+
         # 4. 每個周期統計表
         cursor.execute(
             """
@@ -291,6 +308,30 @@ class CourtSaleDatabase:
             FROM properties
             GROUP BY strftime('%Y-W%W', auction_date)
             ORDER BY auction_week ASC
+            """
+        )
+
+        # 6. 依開標月份 (YYYY-MM) 統計視圖：觀察每月變賣宗數與平均底價變化
+        cursor.execute("DROP VIEW IF EXISTS v_monthly_auction_summary")
+        cursor.execute(
+            """
+            CREATE VIEW v_monthly_auction_summary AS
+            SELECT
+                strftime('%Y-%m', auction_date) AS auction_month,
+                COUNT(DISTINCT case_uid) AS case_count,
+                COUNT(prop_uid) AS total_properties,
+                SUM(CASE WHEN is_residential = 1 THEN 1 ELSE 0 END) AS residential_units,
+                ROUND(AVG(CASE WHEN is_residential = 1 AND base_price_mop > 0 THEN base_price_mop END), 2) AS avg_residential_price_mop,
+                SUM(CASE WHEN is_parking = 1 THEN 1 ELSE 0 END) AS parking_spaces,
+                ROUND(AVG(CASE WHEN is_parking = 1 AND base_price_mop > 0 THEN base_price_mop END), 2) AS avg_parking_price_mop,
+                SUM(CASE WHEN target_category = '商業/寫字樓' THEN 1 ELSE 0 END) AS commercial_units,
+                ROUND(AVG(CASE WHEN target_category = '商業/寫字樓' AND base_price_mop > 0 THEN base_price_mop END), 2) AS avg_commercial_price_mop,
+                SUM(CASE WHEN asset_kind = '動產' OR target_category LIKE '動產%' THEN 1 ELSE 0 END) AS movable_items,
+                SUM(CASE WHEN target_category = '工業' THEN 1 ELSE 0 END) AS industrial_units,
+                SUM(CASE WHEN prior_appearances_count > 0 THEN 1 ELSE 0 END) AS repeated_items
+            FROM properties
+            GROUP BY strftime('%Y-%m', auction_date)
+            ORDER BY auction_month ASC
             """
         )
         self.conn.commit()
@@ -630,6 +671,33 @@ class CourtSaleDatabase:
                         diff_info["prev_auction_date"],
                         diff_info["prev_cycle_id"],
                         diff_info["prev_base_price_mop"],
+                        diff_info["price_diff_mop"],
+                        diff_info["price_diff_pct"],
+                        diff_info["repeat_status_flag"],
+                    ),
+                )
+
+                # 記錄該筆標的在當前追蹤週期 (cycle_id) 的快照狀態，供日後回看歷史週期儀表板
+                cursor.execute(
+                    """
+                    INSERT INTO cycle_properties_snapshot (
+                        cycle_id, prop_uid, is_active_at_cycle, base_price_mop,
+                        prior_appearances_count, price_diff_mop, price_diff_pct, repeat_status_flag
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(cycle_id, prop_uid) DO UPDATE SET
+                        is_active_at_cycle = excluded.is_active_at_cycle,
+                        base_price_mop = excluded.base_price_mop,
+                        prior_appearances_count = excluded.prior_appearances_count,
+                        price_diff_mop = excluded.price_diff_mop,
+                        price_diff_pct = excluded.price_diff_pct,
+                        repeat_status_flag = excluded.repeat_status_flag
+                    """,
+                    (
+                        cycle_id,
+                        prop_uid,
+                        is_upcoming,
+                        p["base_price_mop"],
+                        diff_info["prior_appearances_count"],
                         diff_info["price_diff_mop"],
                         diff_info["price_diff_pct"],
                         diff_info["repeat_status_flag"],
@@ -1264,6 +1332,27 @@ def export_to_excel_and_csv(db: CourtSaleDatabase, excel_path: str = "macau_cour
             db.conn,
         )
 
+        # 5.5：月度統計與價格變化趨勢
+        df_monthly_auction = pd.read_sql_query(
+            """
+            SELECT
+                auction_month AS '開標月份',
+                case_count AS '變賣案件宗數',
+                total_properties AS '變賣財產總項數',
+                residential_units AS '住宅宗數',
+                avg_residential_price_mop AS '住宅平均底價(MOP)',
+                parking_spaces AS '停車位宗數',
+                avg_parking_price_mop AS '車位平均底價(MOP)',
+                commercial_units AS '商業／寫字樓宗數',
+                avg_commercial_price_mop AS '商業平均底價(MOP)',
+                industrial_units AS '工業宗數',
+                movable_items AS '動產項數',
+                repeated_items AS '跨期重拍項數'
+            FROM v_monthly_auction_summary
+            """,
+            db.conn,
+        )
+
         # 6：每週開標數量統計
         df_weekly_auction = pd.read_sql_query(
             """
@@ -1329,6 +1418,7 @@ def export_to_excel_and_csv(db: CourtSaleDatabase, excel_path: str = "macau_cour
             df_movable,
             df_industrial,
             df_repeated,
+            df_monthly_auction,
             df_weekly_auction,
             df_cycle_stats,
             df_archived,
@@ -1343,6 +1433,7 @@ def export_to_excel_and_csv(db: CourtSaleDatabase, excel_path: str = "macau_cour
             df_movable.to_excel(writer, sheet_name="動產重點追蹤", index=False)
             df_industrial.to_excel(writer, sheet_name="工業重點追蹤", index=False)
             df_repeated.to_excel(writer, sheet_name="跨期重拍與價差監察", index=False)
+            df_monthly_auction.to_excel(writer, sheet_name="月度統計與價格趨勢", index=False)
             df_weekly_auction.to_excel(writer, sheet_name="每週開標數量統計", index=False)
             df_cycle_stats.to_excel(writer, sheet_name="每週追蹤周期紀錄", index=False)
             df_archived.to_excel(writer, sheet_name="歷史已開標歸檔", index=False)
@@ -1517,6 +1608,23 @@ def export_html_dashboard(
     cursor.execute("SELECT * FROM v_auction_week_summary ORDER BY auction_week ASC")
     weekly_summary = [dict(r) for r in cursor.fetchall()]
 
+    cursor.execute("SELECT * FROM v_monthly_auction_summary ORDER BY auction_month ASC")
+    monthly_summary = [dict(r) for r in cursor.fetchall()]
+
+    cursor.execute(
+        """
+        SELECT cycle_id, prop_uid, is_active_at_cycle, base_price_mop,
+               prior_appearances_count, price_diff_mop, price_diff_pct, repeat_status_flag
+        FROM cycle_properties_snapshot
+        """
+    )
+    cycle_snapshots = {}
+    for sr in cursor.fetchall():
+        cid = sr["cycle_id"]
+        if cid not in cycle_snapshots:
+            cycle_snapshots[cid] = []
+        cycle_snapshots[cid].append(dict(sr))
+
     cursor.execute(
         """
         SELECT
@@ -1552,6 +1660,8 @@ def export_html_dashboard(
         "current_cycle_id": current_cycle_id,
         "cycle_stats": cycle_stats,
         "weekly_summary": weekly_summary,
+        "monthly_summary": monthly_summary,
+        "cycle_snapshots": cycle_snapshots,
         "properties": properties,
     }
     json_payload = json.dumps(payload, ensure_ascii=False)
@@ -1618,13 +1728,20 @@ def export_html_dashboard(
         <span class="font-bold bg-blue-600 text-white px-2 py-0.5 rounded">自動防疊加與過期歸檔</span>
         <span>未過開標週期的案件每週更新時<strong>自動合併不疊加</strong>；已過開標日期的案件自動轉入<strong>「⚪ 歷史已開標歸檔」</strong>並永久保留於資料庫供日後重拍比對價差。</span>
       </div>
-      <div class="flex items-center gap-2 font-medium">
-        <span>目前檢視範圍：</span>
-        <select id="selectLifecycle" class="px-2.5 py-1 rounded-lg border border-blue-300 bg-white text-slate-800 font-semibold focus:outline-none focus:ring-2 focus:ring-blue-500">
-          <option value="ACTIVE_ONLY">🟢 僅顯示待開標 (在列標的)</option>
-          <option value="ALL">📊 顯示全部 (待開標 + 歷史已開標)</option>
-          <option value="ARCHIVED_ONLY">⚪ 僅顯示已過開標期 (歷史歸檔)</option>
-        </select>
+      <div class="flex flex-wrap items-center gap-3 font-medium">
+        <div class="flex items-center gap-1.5">
+          <span>📅 切換追蹤週期：</span>
+          <select id="selectCycleSnapshot" class="px-2.5 py-1 rounded-lg border border-indigo-400 bg-white text-indigo-900 font-bold focus:outline-none focus:ring-2 focus:ring-indigo-500">
+          </select>
+        </div>
+        <div class="flex items-center gap-1.5">
+          <span>檢視範圍：</span>
+          <select id="selectLifecycle" class="px-2.5 py-1 rounded-lg border border-blue-300 bg-white text-slate-800 font-semibold focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <option value="ACTIVE_ONLY">🟢 僅顯示待開標 (在列標的)</option>
+            <option value="ALL">📊 顯示全部 (待開標 + 歷史已開標)</option>
+            <option value="ARCHIVED_ONLY">⚪ 僅顯示已過開標期 (歷史歸檔)</option>
+          </select>
+        </div>
       </div>
     </div>
 
@@ -1744,6 +1861,20 @@ def export_html_dashboard(
         </div>
         <div class="relative h-60">
           <canvas id="chartCourtBreakdown"></canvas>
+        </div>
+      </div>
+
+      <!-- 圖表 5：月度宗數與住宅／車位平均底價變化趨勢 (雙軸圖) -->
+      <div class="lg:col-span-12 bg-white p-4 sm:p-5 rounded-xl border border-slate-200 shadow-sm">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+          <div>
+            <h2 class="text-sm font-bold text-slate-800">📈 月度統計：每月變賣宗數與住宅／車位平均底價變化趨勢</h2>
+            <p class="text-xs text-slate-500">長條圖（左軸）顯示每月案件及住宅／車位宗數；折線圖（右軸）追蹤每月住宅與車位平均底價（萬澳門元）走勢</p>
+          </div>
+          <span class="text-xs px-2.5 py-0.5 bg-indigo-50 text-indigo-700 rounded font-medium">跨月價量趨勢</span>
+        </div>
+        <div class="relative h-72">
+          <canvas id="chartMonthlyTrend"></canvas>
         </div>
       </div>
     </section>
@@ -1867,7 +1998,10 @@ def export_html_dashboard(
   <script>
     const DASHBOARD_DATA = {json_payload};
 
+    const chartInstances = {{}};
+
     const state = {{
+      selectedCycle: DASHBOARD_DATA.current_cycle_id,
       activeTab: 'ALL',
       lifecycleFilter: 'ACTIVE_ONLY',
       searchQuery: '',
@@ -1892,12 +2026,62 @@ def export_html_dashboard(
       return 'OTHER';
     }}
 
-    function initKPIsAndFilters() {{
-      document.getElementById('hdrCycleId').textContent = DASHBOARD_DATA.current_cycle_id;
-      document.getElementById('hdrRefDate').textContent = DASHBOARD_DATA.reference_date;
-      document.getElementById('hdrLastUpdated').textContent = DASHBOARD_DATA.last_updated;
+    function getPropertiesForCycle(cycleId) {{
+      const snaps = (DASHBOARD_DATA.cycle_snapshots || {{}})[cycleId];
+      if (!snaps || snaps.length === 0) {{
+        return DASHBOARD_DATA.properties;
+      }}
+      const propMap = {{}};
+      DASHBOARD_DATA.properties.forEach(p => {{ propMap[p.prop_uid] = p; }});
+      const result = [];
+      snaps.forEach(s => {{
+        const base = propMap[s.prop_uid];
+        if (base) {{
+          result.push({{
+            ...base,
+            is_active: s.is_active_at_cycle,
+            lifecycle_status: s.is_active_at_cycle === 1 ? '🟢 待開標(在列)' : '⚪ 已過開標期(歷史歸檔)',
+            base_price_mop: s.base_price_mop !== null ? s.base_price_mop : base.base_price_mop,
+            prior_appearances_count: s.prior_appearances_count,
+            price_diff_mop: s.price_diff_mop,
+            price_diff_pct: s.price_diff_pct,
+            repeat_status_flag: s.repeat_status_flag || base.repeat_status_flag
+          }});
+        }}
+      }});
+      return result;
+    }}
+
+    function initCycleSelectorAndFilters() {{
+      const selectCycle = document.getElementById('selectCycleSnapshot');
+      selectCycle.innerHTML = '';
+      const statsList = DASHBOARD_DATA.cycle_stats || [];
+      if (statsList.length > 0) {{
+        statsList.forEach((cs, idx) => {{
+          const opt = document.createElement('option');
+          opt.value = cs.cycle_id;
+          const tag = idx === 0 ? ' (最新)' : ' (歷史回看)';
+          opt.textContent = `${{cs.cycle_id}}${{tag}} — ${{cs.total_active_properties}}項`;
+          selectCycle.appendChild(opt);
+        }});
+      }} else {{
+        const opt = document.createElement('option');
+        opt.value = DASHBOARD_DATA.current_cycle_id;
+        opt.textContent = DASHBOARD_DATA.current_cycle_id;
+        selectCycle.appendChild(opt);
+      }}
+      selectCycle.value = state.selectedCycle;
 
       const allProps = DASHBOARD_DATA.properties;
+    }}
+
+    function initKPIsAndFilters() {{
+      const csInfo = (DASHBOARD_DATA.cycle_stats || []).find(c => c.cycle_id === state.selectedCycle);
+      document.getElementById('hdrCycleId').textContent = state.selectedCycle;
+      document.getElementById('hdrRefDate').textContent = csInfo ? csInfo.run_timestamp.slice(0, 10) : DASHBOARD_DATA.reference_date;
+      document.getElementById('hdrLastUpdated').textContent = csInfo ? csInfo.page_last_updated : DASHBOARD_DATA.last_updated;
+
+      const allProps = getPropertiesForCycle(state.selectedCycle);
       const activeProps = allProps.filter(p => p.is_active === 1);
       const archivedProps = allProps.filter(p => p.is_active === 0);
 
@@ -1938,38 +2122,38 @@ def export_html_dashboard(
       document.getElementById('tabCountRep').textContent = repProps.length;
       document.getElementById('tabCountArc').textContent = archivedProps.length;
 
-      const selectWeek = document.getElementById('selectWeek');
-      DASHBOARD_DATA.weekly_summary.forEach(w => {{
-        const opt = document.createElement('option');
-        opt.value = w.auction_week;
-        opt.textContent = `${{w.auction_week}} (${{w.week_start_date}} ~ ${{w.week_end_date}}) [${{w.total_properties}}項]`;
-        selectWeek.appendChild(opt);
-      }});
-
-      const selectCourt = document.getElementById('selectCourt');
-      const courts = Array.from(new Set(allProps.map(p => p.court).filter(Boolean))).sort();
-      courts.forEach(c => {{
-        const opt = document.createElement('option');
-        opt.value = c;
-        opt.textContent = c;
-        selectCourt.appendChild(opt);
-      }});
     }}
 
     function initCharts() {{
-      const weeks = DASHBOARD_DATA.weekly_summary;
-      const activeProps = DASHBOARD_DATA.properties.filter(p => p.is_active === 1);
+      Object.values(chartInstances).forEach(ch => {{ if (ch && typeof ch.destroy === 'function') ch.destroy(); }});
+
+      const cycleProps = getPropertiesForCycle(state.selectedCycle);
+      const activeProps = cycleProps.filter(p => p.is_active === 1);
+
+      // 依當前所選週期的標的重新彙總每週開標數量
+      const weekBucketMap = {{}};
+      cycleProps.forEach(p => {{
+        const wk = findAuctionWeekForDate(p.auction_date);
+        if (!weekBucketMap[wk]) {{
+          weekBucketMap[wk] = {{ week: wk, label: wk, res: 0, park: 0, comm: 0, other: 0 }};
+        }}
+        if (p.is_residential === 1) weekBucketMap[wk].res += 1;
+        else if (p.is_parking === 1) weekBucketMap[wk].park += 1;
+        else if (p.target_category === '商業/寫字樓') weekBucketMap[wk].comm += 1;
+        else weekBucketMap[wk].other += 1;
+      }});
+      const weekList = Object.values(weekBucketMap).sort((a, b) => a.week.localeCompare(b.week));
 
       const ctxWeekly = document.getElementById('chartWeeklyVolume').getContext('2d');
-      new Chart(ctxWeekly, {{
+      chartInstances.weekly = new Chart(ctxWeekly, {{
         type: 'bar',
         data: {{
-          labels: weeks.map(w => `${{w.auction_week}} (${{w.week_start_date.slice(5)}})`),
+          labels: weekList.map(w => w.label),
           datasets: [
-            {{ label: '住宅', data: weeks.map(w => w.residential_units), backgroundColor: '#2563eb' }},
-            {{ label: '停車位', data: weeks.map(w => w.parking_spaces), backgroundColor: '#10b981' }},
-            {{ label: '商業／寫字樓', data: weeks.map(w => w.commercial_units), backgroundColor: '#f59e0b' }},
-            {{ label: '動產及其他', data: weeks.map(w => (w.movable_items || 0) + (w.other_items || 0)), backgroundColor: '#8b5cf6' }}
+            {{ label: '住宅', data: weekList.map(w => w.res), backgroundColor: '#2563eb' }},
+            {{ label: '停車位', data: weekList.map(w => w.park), backgroundColor: '#10b981' }},
+            {{ label: '商業／寫字樓', data: weekList.map(w => w.comm), backgroundColor: '#f59e0b' }},
+            {{ label: '動產及其他', data: weekList.map(w => w.other), backgroundColor: '#8b5cf6' }}
           ]
         }},
         options: {{
@@ -1990,7 +2174,7 @@ def export_html_dashboard(
       const otherCnt = Math.max(0, activeProps.length - (resCnt + parkCnt + commCnt + movCnt));
 
       const ctxDonut = document.getElementById('chartCategoryDonut').getContext('2d');
-      new Chart(ctxDonut, {{
+      chartInstances.donut = new Chart(ctxDonut, {{
         type: 'doughnut',
         data: {{
           labels: ['住宅 (' + resCnt + ')', '商業／寫字樓 (' + commCnt + ')', '停車位 (' + parkCnt + ')', '其他不動產/股權 (' + otherCnt + ')', '動產 (' + movCnt + ')'],
@@ -2018,7 +2202,7 @@ def export_html_dashboard(
       const parkByBucket = buckets.map(b => activeProps.filter(p => p.is_parking === 1 && (p.base_price_mop || 0) >= b.min && (p.base_price_mop || 0) < b.max).length);
 
       const ctxPrice = document.getElementById('chartPriceDistribution').getContext('2d');
-      new Chart(ctxPrice, {{
+      chartInstances.price = new Chart(ctxPrice, {{
         type: 'bar',
         data: {{
           labels: buckets.map(b => b.label),
@@ -2040,7 +2224,7 @@ def export_html_dashboard(
       const courtRepeated = courtNames.map(c => activeProps.filter(p => p.court === c && (p.prior_appearances_count || 0) > 0).length);
 
       const ctxCourt = document.getElementById('chartCourtBreakdown').getContext('2d');
-      new Chart(ctxCourt, {{
+      chartInstances.court = new Chart(ctxCourt, {{
         type: 'bar',
         data: {{
           labels: courtNames,
@@ -2057,12 +2241,93 @@ def export_html_dashboard(
           scales: {{ x: {{ beginAtZero: true }} }}
         }}
       }});
+
+      // 5. 月度宗數與住宅/車位平均底價雙軸趨勢圖
+      const months = DASHBOARD_DATA.monthly_summary || [];
+      const ctxMonthly = document.getElementById('chartMonthlyTrend').getContext('2d');
+      chartInstances.monthly = new Chart(ctxMonthly, {{
+        type: 'bar',
+        data: {{
+          labels: months.map(m => m.auction_month),
+          datasets: [
+            {{
+              label: '住宅宗數',
+              data: months.map(m => m.residential_units || 0),
+              backgroundColor: 'rgba(37, 99, 235, 0.75)',
+              yAxisID: 'yCount',
+              order: 2
+            }},
+            {{
+              label: '停車位宗數',
+              data: months.map(m => m.parking_spaces || 0),
+              backgroundColor: 'rgba(16, 185, 129, 0.75)',
+              yAxisID: 'yCount',
+              order: 2
+            }},
+            {{
+              label: '案件總宗數',
+              data: months.map(m => m.case_count || 0),
+              backgroundColor: 'rgba(148, 163, 184, 0.45)',
+              yAxisID: 'yCount',
+              order: 3
+            }},
+            {{
+              label: '住宅均價 (萬MOP)',
+              data: months.map(m => m.avg_residential_price_mop ? Number((m.avg_residential_price_mop / 10000).toFixed(1)) : null),
+              type: 'line',
+              borderColor: '#e11d48',
+              backgroundColor: '#e11d48',
+              borderWidth: 2.5,
+              tension: 0.25,
+              spanGaps: true,
+              yAxisID: 'yPrice',
+              order: 1
+            }},
+            {{
+              label: '車位均價 (萬MOP)',
+              data: months.map(m => m.avg_parking_price_mop ? Number((m.avg_parking_price_mop / 10000).toFixed(1)) : null),
+              type: 'line',
+              borderColor: '#d97706',
+              backgroundColor: '#d97706',
+              borderWidth: 2.5,
+              borderDash: [5, 4],
+              tension: 0.25,
+              spanGaps: true,
+              yAxisID: 'yPrice',
+              order: 1
+            }}
+          ]
+        }},
+        options: {{
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: {{ mode: 'index', intersect: false }},
+          plugins: {{
+            legend: {{ position: 'top', labels: {{ boxWidth: 12, font: {{ size: 11 }} }} }}
+          }},
+          scales: {{
+            yCount: {{
+              type: 'linear',
+              position: 'left',
+              beginAtZero: true,
+              title: {{ display: true, text: '宗數 / 項目數', font: {{ size: 11 }} }}
+            }},
+            yPrice: {{
+              type: 'linear',
+              position: 'right',
+              beginAtZero: true,
+              grid: {{ drawOnChartArea: false }},
+              title: {{ display: true, text: '平均底價 (萬 MOP)', font: {{ size: 11 }} }}
+            }}
+          }}
+        }}
+      }});
     }}
 
     function applyFiltersAndRender() {{
       const q = state.searchQuery.trim().toLowerCase();
 
-      let list = DASHBOARD_DATA.properties.filter(p => {{
+      let list = getPropertiesForCycle(state.selectedCycle).filter(p => {{
         if (state.activeTab === 'ARCHIVED') {{
           if (p.is_active !== 0) return false;
         }} else if (state.activeTab === 'REPEATED') {{
@@ -2221,7 +2486,7 @@ def export_html_dashboard(
     }}
 
     function openDetailModal(propUid) {{
-      const item = DASHBOARD_DATA.properties.find(p => p.prop_uid === propUid);
+      const item = getPropertiesForCycle(state.selectedCycle).find(p => p.prop_uid === propUid);
       if (!item) return;
 
       document.getElementById('modalCategoryBadge').textContent = `${{item.lifecycle_status}} ｜ ${{item.target_category}}`;
@@ -2304,9 +2569,17 @@ def export_html_dashboard(
     }}
 
     window.addEventListener('DOMContentLoaded', () => {{
+      initCycleSelectorAndFilters();
       initKPIsAndFilters();
       initCharts();
       applyFiltersAndRender();
+
+      document.getElementById('selectCycleSnapshot').addEventListener('change', e => {{
+        state.selectedCycle = e.target.value;
+        initKPIsAndFilters();
+        initCharts();
+        applyFiltersAndRender();
+      }});
 
       document.querySelectorAll('.tab-btn').forEach(btn => {{
         btn.addEventListener('click', () => setActiveTab(btn.getAttribute('data-tab')));
